@@ -1,0 +1,76 @@
+name: bias-bot
+
+on:
+  schedule:
+    # GitHub 排程使用 UTC；台灣時間 = UTC + 8。排程可能延遲數分鐘。
+    - cron: "15 1 * * 1-5"      # 09:15 開盤報價
+    - cron: "*/10 1-5 * * 1-5"  # 09:00-13:50 每 10 分鐘盤中檢查（程式只在 09:00-13:35 動作）
+    - cron: "40 6 * * 1-5"      # 14:40 收盤整理（更新開收價、重算隔日購買區間）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "要執行的模式（第一次請先選 test，再選 close）"
+        type: choice
+        default: close
+        options: [close, open, intraday, test]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bias-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 判斷模式
+        id: m
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            MODE="$INPUT_MODE"; FORCE=1
+          else
+            FORCE=""
+            case "$SCHEDULE" in
+              "15 1 * * 1-5") MODE=open ;;
+              "40 6 * * 1-5") MODE=close ;;
+              *) MODE=intraday ;;
+            esac
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "force=$FORCE" >> "$GITHUB_OUTPUT"
+
+      - name: 執行
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE: ${{ steps.m.outputs.force }}
+        run: python bias_bot.py "${{ steps.m.outputs.mode }}"
+
+      - name: 提交資料（每日開收價與區間）
+        if: always()
+        run: |
+          git config user.name "bias-bot"
+          git config user.email "bias-bot@users.noreply.github.com"
+          mkdir -p data
+          git add data
+          if ! git diff --cached --quiet; then
+            git commit -m "data: ${{ steps.m.outputs.mode }} $(TZ=Asia/Taipei date +'%F %R')"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
